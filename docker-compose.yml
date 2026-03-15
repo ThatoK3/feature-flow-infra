@@ -1,348 +1,180 @@
-version: "3.9"
-
-# FeatureFlow — Data Sources Stack
-# Includes: SQL Server 2022 (CDC), MySQL 8 (binlog), MongoDB 6 (replica set),
-#           PostgreSQL 15 (logical replication), MinIO (S3-compatible)
-#
-# All credentials are read from .env — copy .env.example to .env before use.
-# Run:  make setup   (first time)
-#       make up      (subsequent starts)
-
-networks:
-  featureflow:
-    driver: bridge
-
-volumes:
-  sqlserver_data:
-  mysql_data:
-  mongo_data:
-  postgres_data:
-  minio_data:
-
 services:
 
-  # ── SQL Server 2022 ────────────────────────────────────────────────────────
-  sqlserver:
-    image: mcr.microsoft.com/mssql/server:2022-latest
-    container_name: ff_sqlserver
+  # ── MongoDB — Patient Demographics & Geographic Data ───────────────────────
+  mongodb:
+    image: mongo:6.0
+    container_name: healthcare-mongodb
     restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+      MONGO_INITDB_DATABASE: healthcare
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+      - ./mongo-init:/docker-entrypoint-initdb.d
+      - ./data:/data/import
+    networks:
+      - spark-net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  # ── PostgreSQL — Clinical Records & Lab Results ────────────────────────────
+  postgres:
+    image: postgres:15
+    container_name: healthcare-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: healthcare
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d
+      - ./data:/data/import
+    networks:
+      - spark-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d healthcare"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── MS SQL Server — Hospital Administration & Providers ───────────────────
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: healthcare-mssql
+    restart: unless-stopped
+    environment:
+      ACCEPT_EULA: Y
+      SA_PASSWORD: ${MSSQL_SA_PASSWORD}
+      MSSQL_PID: Developer
     ports:
       - "1433:1433"
-    environment:
-      ACCEPT_EULA: "Y"
-      SA_PASSWORD: "${SA_PASSWORD}"
-      MSSQL_PID: Developer
-      MSSQL_AGENT_ENABLED: "true"
     volumes:
-      - sqlserver_data:/var/opt/mssql
-    networks: [featureflow]
+      - mssql_data:/var/opt/mssql
+      - ./mssql-init:/docker-entrypoint-initdb.d
+      - ./data:/data/import
+    networks:
+      - spark-net
     healthcheck:
-      test:
-        - CMD-SHELL
-        - >
-          /opt/mssql-tools18/bin/sqlcmd
-          -S localhost -U sa -P "$$SA_PASSWORD"
-          -Q 'SELECT 1' -C -b -o /dev/null
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P '${MSSQL_SA_PASSWORD}' -Q 'SELECT 1' -C -b -o /dev/null"]
       interval: 15s
       timeout: 10s
-      retries: 12
+      retries: 10
       start_period: 30s
 
-  sqlserver-init:
-    image: mcr.microsoft.com/mssql/server:2022-latest
-    container_name: ff_sqlserver_init
-    restart: "no"
-    depends_on:
-      sqlserver:
-        condition: service_healthy
-    networks: [featureflow]
-    environment:
-      SA_PASSWORD: "${SA_PASSWORD}"
-    entrypoint:
-      - bash
-      - -c
-      - |
-        set -e
-        echo "Creating SQL Server databases..."
-        /opt/mssql-tools18/bin/sqlcmd -S sqlserver -U sa -P "$${SA_PASSWORD}" -C -Q "
-          IF DB_ID('RiskDataMart')  IS NULL CREATE DATABASE RiskDataMart;
-          IF DB_ID('ClinicalDB')    IS NULL CREATE DATABASE ClinicalDB;
-          IF DB_ID('SupplyChainDB') IS NULL CREATE DATABASE SupplyChainDB;
-          IF DB_ID('PolicyDB')      IS NULL CREATE DATABASE PolicyDB;
-          IF DB_ID('BillingDB')     IS NULL CREATE DATABASE BillingDB;
-        "
-        echo "Enabling CDC on all databases..."
-        /opt/mssql-tools18/bin/sqlcmd -S sqlserver -U sa -P "$${SA_PASSWORD}" -C -Q "
-          USE RiskDataMart;  EXEC sys.sp_cdc_enable_db;
-          USE ClinicalDB;    EXEC sys.sp_cdc_enable_db;
-          USE SupplyChainDB; EXEC sys.sp_cdc_enable_db;
-          USE PolicyDB;      EXEC sys.sp_cdc_enable_db;
-          USE BillingDB;     EXEC sys.sp_cdc_enable_db;
-        "
-        echo "SQL Server init complete."
-
-  # ── MySQL 8 (binlog CDC) ───────────────────────────────────────────────────
+  # ── MySQL 8 — Binlog CDC enabled ───────────────────────────────────────────
   mysql:
     image: mysql:8.0
-    container_name: ff_mysql
+    container_name: healthcare-mysql
     restart: unless-stopped
-    ports:
-      - "3306:3306"
     environment:
-      MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD}"
-      MYSQL_USER: featureflow
-      MYSQL_PASSWORD: "${MYSQL_PASSWORD}"
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: healthcare
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
     command:
       - --server-id=1
       - --log-bin=mysql-bin
       - --binlog-format=ROW
       - --binlog-row-image=FULL
-      - --binlog-expire-logs-seconds=604800
-      - --max-binlog-size=100M
       - --gtid-mode=ON
       - --enforce-gtid-consistency=ON
-      - --sync-binlog=1
-      - --innodb-flush-log-at-trx-commit=1
+      - --binlog-expire-logs-seconds=604800
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
-      - --default-authentication-plugin=mysql_native_password
+    ports:
+      - "3306:3306"
     volumes:
       - mysql_data:/var/lib/mysql
-    networks: [featureflow]
+      - ./mysql-init:/docker-entrypoint-initdb.d
+      - ./data:/data/import
+    networks:
+      - spark-net
     healthcheck:
-      test:
-        - CMD-SHELL
-        - mysqladmin ping -h localhost -u root -p"$${MYSQL_ROOT_PASSWORD}" --silent
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}", "--silent"]
       interval: 10s
       timeout: 5s
-      retries: 12
+      retries: 10
       start_period: 20s
 
-  mysql-init:
-    image: mysql:8.0
-    container_name: ff_mysql_init
-    restart: "no"
-    depends_on:
-      mysql:
-        condition: service_healthy
-    networks: [featureflow]
-    environment:
-      MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD}"
-      CDC_PASSWORD: "${CDC_PASSWORD}"
-    entrypoint:
-      - bash
-      - -c
-      - |
-        set -e
-        echo "Creating MySQL databases and CDC user..."
-        mysql -h mysql -u root -p"$${MYSQL_ROOT_PASSWORD}" <<SQL
-          CREATE DATABASE IF NOT EXISTS credit_data;
-          CREATE DATABASE IF NOT EXISTS patient_admin;
-          CREATE DATABASE IF NOT EXISTS procurement;
-          CREATE DATABASE IF NOT EXISTS claims_db;
-          CREATE DATABASE IF NOT EXISTS network_ops;
-          CREATE USER IF NOT EXISTS 'cdc_user'@'%'
-            IDENTIFIED WITH mysql_native_password BY '$${CDC_PASSWORD}';
-          GRANT SELECT, RELOAD, SHOW DATABASES,
-                REPLICATION SLAVE, REPLICATION CLIENT
-            ON *.* TO 'cdc_user'@'%';
-          FLUSH PRIVILEGES;
-        SQL
-        echo "MySQL init complete."
-
-  # ── MongoDB 6 (single-node replica set) ────────────────────────────────────
-  # --auth is intentionally omitted here; MONGO_INITDB_ROOT_* bootstraps auth
-  # before replica set initiation. Auth is enforced after mongodb-init runs.
-  mongodb:
-    image: mongo:6.0
-    container_name: ff_mongodb
-    restart: unless-stopped
-    ports:
-      - "27017:27017"
-    command: mongod --replSet rs0 --bind_ip_all
-    environment:
-      MONGO_INITDB_ROOT_USERNAME: root
-      MONGO_INITDB_ROOT_PASSWORD: "${MONGO_ROOT_PASSWORD}"
-    volumes:
-      - mongo_data:/data/db
-    networks: [featureflow]
-    healthcheck:
-      test:
-        - CMD-SHELL
-        - mongosh --quiet --eval 'db.adminCommand({ping:1}).ok' | grep -q 1
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 15s
-
-  mongodb-init:
-    image: mongo:6.0
-    container_name: ff_mongodb_init
-    restart: "no"
-    depends_on:
-      mongodb:
-        condition: service_healthy
-    networks: [featureflow]
-    environment:
-      MONGO_ROOT_PASSWORD: "${MONGO_ROOT_PASSWORD}"
-      CDC_PASSWORD: "${CDC_PASSWORD}"
-    entrypoint:
-      - bash
-      - -c
-      - |
-        set -e
-        echo "Initiating MongoDB replica set..."
-        mongosh "mongodb://mongodb:27017/admin" --eval "
-          try { rs.status(); print('rs0 already initiated'); }
-          catch(e) {
-            rs.initiate({_id:'rs0', members:[{_id:0, host:'mongodb:27017'}]});
-            print('rs0 initiated');
-          }
-        "
-        echo "Waiting for primary election..."
-        sleep 6
-
-        echo "Creating collections and CDC user..."
-        mongosh "mongodb://mongodb:27017/admin?replicaSet=rs0" --eval "
-          db.getSiblingDB('loan_documents').createCollection('applications');
-          db.getSiblingDB('clinical_notes').createCollection('notes');
-          db.getSiblingDB('sensor_data').createCollection('readings');
-          db.getSiblingDB('risk_assessments').createCollection('surveys');
-          db.getSiblingDB('interactions').createCollection('events');
-
-          if (!db.getUser('cdc_user')) {
-            db.createUser({
-              user: 'cdc_user',
-              pwd: '$${CDC_PASSWORD}',
-              roles: [
-                {role:'read', db:'loan_documents'},
-                {role:'read', db:'clinical_notes'},
-                {role:'read', db:'sensor_data'},
-                {role:'read', db:'risk_assessments'},
-                {role:'read', db:'interactions'},
-                {role:'clusterMonitor', db:'admin'},
-                {role:'read', db:'local'}
-              ]
-            });
-            print('cdc_user created');
-          } else { print('cdc_user already exists'); }
-        "
-        echo "MongoDB init complete."
-
-  # ── PostgreSQL 15 (logical replication) ────────────────────────────────────
-  postgres:
-    image: postgres:15
-    container_name: ff_postgres
-    restart: unless-stopped
-    ports:
-      - "5432:5432"
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
-      POSTGRES_DB: postgres
-    command:
-      - postgres
-      - -c
-      - wal_level=logical
-      - -c
-      - max_replication_slots=10
-      - -c
-      - max_wal_senders=10
-      - -c
-      - wal_keep_size=256
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    networks: [featureflow]
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-
-  postgres-init:
-    image: postgres:15
-    container_name: ff_postgres_init
-    restart: "no"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    networks: [featureflow]
-    environment:
-      PGPASSWORD: "${POSTGRES_PASSWORD}"
-      CDC_PASSWORD: "${CDC_PASSWORD}"
-    entrypoint:
-      - bash
-      - -c
-      - |
-        set -e
-        echo "Creating PostgreSQL databases..."
-        for db in ratings registry demand tables_db catalog_db; do
-          psql -h postgres -U postgres \
-            -tc "SELECT 1 FROM pg_database WHERE datname='$db'" \
-            | grep -q 1 \
-            || psql -h postgres -U postgres -c "CREATE DATABASE $db"
-        done
-
-        echo "Creating CDC user and granting access..."
-        psql -h postgres -U postgres <<SQL
-          DO \$\$
-          BEGIN
-            IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='cdc_user') THEN
-              CREATE USER cdc_user
-                WITH REPLICATION LOGIN PASSWORD '$${CDC_PASSWORD}';
-            END IF;
-          END
-          \$\$;
-          GRANT CONNECT ON DATABASE ratings    TO cdc_user;
-          GRANT CONNECT ON DATABASE registry   TO cdc_user;
-          GRANT CONNECT ON DATABASE demand     TO cdc_user;
-          GRANT CONNECT ON DATABASE tables_db  TO cdc_user;
-          GRANT CONNECT ON DATABASE catalog_db TO cdc_user;
-        SQL
-        echo "PostgreSQL init complete."
-
-  # ── MinIO (S3-compatible object store) ─────────────────────────────────────
+  # ── MinIO — Lifestyle & Batch Parquet files ────────────────────────────────
   minio:
     image: minio/minio:latest
-    container_name: ff_minio
+    container_name: healthcare-minio
     restart: unless-stopped
-    ports:
-      - "9000:9000"   # S3 API
-      - "9001:9001"   # Web console
-    environment:
-      MINIO_ROOT_USER: "${MINIO_USER}"
-      MINIO_ROOT_PASSWORD: "${MINIO_PASSWORD}"
     command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
     volumes:
       - minio_data:/data
-    networks: [featureflow]
+    networks:
+      - spark-net
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live"]
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 10s
       timeout: 5s
-      retries: 10
+      retries: 5
 
   minio-init:
     image: minio/mc:latest
-    container_name: ff_minio_init
+    container_name: healthcare-minio-init
     restart: "no"
     depends_on:
       minio:
         condition: service_healthy
-    networks: [featureflow]
+    networks:
+      - spark-net
     environment:
-      MINIO_USER: "${MINIO_USER}"
-      MINIO_PASSWORD: "${MINIO_PASSWORD}"
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     entrypoint:
       - sh
       - -c
       - |
-        set -e
-        echo "Configuring MinIO buckets..."
-        mc alias set ff http://minio:9000 "$${MINIO_USER}" "$${MINIO_PASSWORD}"
-        for bucket in credit-risk-ml-archive hospital-imaging-ml supply-chain-lake \
-                      cat-risk-lake telecom-cdr-lake feast-offline-store; do
-          mc mb --ignore-existing ff/$${bucket}
-          echo "  bucket: $${bucket} ready"
-        done
-        echo "MinIO init complete."
+        mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"
+        mc mb --ignore-existing local/healthcare-lifestyle
+        mc mb --ignore-existing local/healthcare-batch
+        echo "MinIO buckets ready."
+
+  # ── Redis — Feast Online Store & Caching ──────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: healthcare-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - spark-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mongodb_data:
+  postgres_data:
+  mssql_data:
+  mysql_data:
+  minio_data:
+  redis_data:
+
+networks:
+  spark-net:
+    external: true
+    name: spark-jupyter-scala_spark-net
