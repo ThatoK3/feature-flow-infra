@@ -1,0 +1,532 @@
+version: '3.8'
+
+# ============================================================
+# FeatureFlow — Data Infrastructure
+# ============================================================
+# Databases          Debezium source strategy
+# -----------------  ----------------------------------------
+# MongoDB            Replica set rs0 (required for change streams)
+# PostgreSQL         wal_level=logical + replication slots
+# MS SQL Server      SQL Agent + CDC per-table
+# MySQL              ROW binlog + GTID (Debezium-ready)
+# MinIO (S3)         Bucket event notifications (no CDC)
+# Redis              Online feature store (all 5 repos)
+#
+# Kafka + Debezium connectors are deployed separately.
+# ============================================================
+
+x-hc: &hc
+  interval: 10s
+  timeout: 5s
+  retries: 5
+  start_period: 30s
+
+services:
+
+  # ============================================================
+  # MONGODB  —  Primary + 2 secondaries (replica set rs0)
+  # ============================================================
+  # Debezium requires a replica set to use change streams.
+  # rs0 is initialised by the mongo-rs-init one-shot container.
+  # A keyfile is required for intra-set auth; generate with:
+  #   openssl rand -base64 756 > ./mongo-keyfile && chmod 400 ./mongo-keyfile
+  #
+  # Repos:
+  #   repo1  application_documents    (loan docs, NLP features)
+  #   repo2  clinical_notes           (NLP + provider workload)
+  #   repo3  supplier_sensor_readings (IoT + risk signals)
+  #   repo4  policy_risk_assessments  (survey data)
+  #   repo5  network_sessions         (device + signal quality)
+  # ============================================================
+  mongo-primary:
+    image: mongo:6.0
+    container_name: featureflow-mongo-primary
+    hostname: mongo-primary
+    restart: unless-stopped
+    command: >
+      mongod --replSet rs0 --bind_ip_all
+      --keyFile /etc/mongo/keyfile --auth
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_primary_data:/data/db
+      - ./mongo-init:/docker-entrypoint-initdb.d:ro
+      - ./mongo-keyfile:/etc/mongo/keyfile:ro
+      - ./data:/data/import
+    networks:
+      featureflow-net:
+        aliases: [mongo-primary]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      <<: *hc
+
+  mongo-secondary-1:
+    image: mongo:6.0
+    container_name: featureflow-mongo-secondary-1
+    hostname: mongo-secondary-1
+    restart: unless-stopped
+    command: >
+      mongod --replSet rs0 --bind_ip_all
+      --keyFile /etc/mongo/keyfile --auth
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+    ports:
+      - "27018:27017"
+    volumes:
+      - mongo_secondary1_data:/data/db
+      - ./mongo-keyfile:/etc/mongo/keyfile:ro
+    networks:
+      featureflow-net:
+        aliases: [mongo-secondary-1]
+    depends_on:
+      mongo-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      <<: *hc
+
+  mongo-secondary-2:
+    image: mongo:6.0
+    container_name: featureflow-mongo-secondary-2
+    hostname: mongo-secondary-2
+    restart: unless-stopped
+    command: >
+      mongod --replSet rs0 --bind_ip_all
+      --keyFile /etc/mongo/keyfile --auth
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+    ports:
+      - "27019:27017"
+    volumes:
+      - mongo_secondary2_data:/data/db
+      - ./mongo-keyfile:/etc/mongo/keyfile:ro
+    networks:
+      featureflow-net:
+        aliases: [mongo-secondary-2]
+    depends_on:
+      mongo-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      <<: *hc
+
+  # One-shot: initialises rs0 once all three nodes are healthy
+  mongo-rs-init:
+    image: mongo:6.0
+    container_name: featureflow-mongo-rs-init
+    restart: "no"
+    networks:
+      - featureflow-net
+    depends_on:
+      mongo-primary:
+        condition: service_healthy
+      mongo-secondary-1:
+        condition: service_healthy
+      mongo-secondary-2:
+        condition: service_healthy
+    environment:
+      MONGO_ROOT_USER: ${MONGO_ROOT_USER}
+      MONGO_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+    entrypoint: >
+      bash -c "
+        sleep 5 &&
+        mongosh --host mongo-primary
+          -u $$MONGO_ROOT_USER -p $$MONGO_ROOT_PASSWORD
+          --authenticationDatabase admin --eval '
+            rs.status().ok === 1
+              ? print(\"rs0 already initialised\")
+              : rs.initiate({
+                  _id: \"rs0\",
+                  members: [
+                    { _id: 0, host: \"mongo-primary:27017\",    priority: 2 },
+                    { _id: 1, host: \"mongo-secondary-1:27017\", priority: 1 },
+                    { _id: 2, host: \"mongo-secondary-2:27017\", priority: 1 }
+                  ]
+                })
+          '
+      "
+
+  # ============================================================
+  # POSTGRESQL  —  Primary + read replica (streaming replication)
+  # ============================================================
+  # wal_level=logical  enables Debezium logical decoding slots.
+  # max_replication_slots=10 covers Debezium + standby.
+  # A dedicated replication role is created by postgres-init.
+  #
+  # Repos:
+  #   repo1  collateral_valuations       (CollateralValuationFeatures)
+  #   repo2  protocol_adherence          (ProtocolAdherenceFeatures)
+  #   repo3  forecast_accuracy_tracking  (ForecastAccuracyFeatures)
+  #   repo4  actuarial_segmentation      (ActuarialSegmentationFeatures)
+  #   repo5  service_plan_engagement     (ProductEngagementFeatures)
+  # ============================================================
+  postgres-primary:
+    image: postgres:15
+    container_name: featureflow-postgres-primary
+    hostname: postgres-primary
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:                   featureflow
+      POSTGRES_USER:                 ${POSTGRES_USER}
+      POSTGRES_PASSWORD:             ${POSTGRES_PASSWORD}
+      POSTGRES_REPLICATION_USER:     ${POSTGRES_REPLICATION_USER}
+      POSTGRES_REPLICATION_PASSWORD: ${POSTGRES_REPLICATION_PASSWORD}
+    command: >
+      postgres
+        -c wal_level=logical
+        -c max_wal_senders=10
+        -c max_replication_slots=10
+        -c wal_keep_size=512
+        -c hot_standby=on
+        -c archive_mode=on
+        -c archive_command='test ! -f /var/lib/postgresql/archive/%f && cp %p /var/lib/postgresql/archive/%f'
+        -c shared_preload_libraries=pg_stat_statements
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_primary_data:/var/lib/postgresql/data
+      - postgres_archive:/var/lib/postgresql/archive
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+      - ./data:/data/import
+    networks:
+      featureflow-net:
+        aliases: [postgres-primary]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d featureflow"]
+      <<: *hc
+
+  postgres-replica:
+    image: postgres:15
+    container_name: featureflow-postgres-replica
+    hostname: postgres-replica
+    restart: unless-stopped
+    environment:
+      PGDATA:           /var/lib/postgresql/data
+      PGPASSWORD:       ${POSTGRES_REPLICATION_PASSWORD}
+      PRIMARY_HOST:     postgres-primary
+      REPLICATION_USER: ${POSTGRES_REPLICATION_USER}
+    entrypoint: >
+      bash -c "
+        if [ ! -s \"$$PGDATA/PG_VERSION\" ]; then
+          pg_basebackup -h $$PRIMARY_HOST -U $$REPLICATION_USER
+                        -D $$PGDATA -Fp -Xs -P -R --checkpoint=fast
+        fi
+        exec postgres -c hot_standby=on -c hot_standby_feedback=on
+      "
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_replica_data:/var/lib/postgresql/data
+    networks:
+      featureflow-net:
+        aliases: [postgres-replica]
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      <<: *hc
+
+  # ============================================================
+  # MS SQL SERVER  —  Primary + 1 replica
+  # ============================================================
+  # MSSQL_AGENT_ENABLED=true is required to run sp_cdc_enable_db
+  # and sp_cdc_enable_table. CDC activation scripts live in
+  # ./mssql-init/ and run after startup via the init container.
+  # Debezium SQL Server connector points at the primary.
+  #
+  # Repos:
+  #   repo1  applicant_profiles + loan_facilities
+  #   repo2  patient_clinical_profiles
+  #   repo3  product_sales_transactions
+  #   repo4  policyholder_profiles
+  #   repo5  subscriber_lifecycle
+  # ============================================================
+  mssql-primary:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: featureflow-mssql-primary
+    hostname: mssql-primary
+    restart: unless-stopped
+    environment:
+      ACCEPT_EULA:         "Y"
+      SA_PASSWORD:         ${MSSQL_SA_PASSWORD}
+      MSSQL_PID:           Developer
+      MSSQL_AGENT_ENABLED: "true"
+    ports:
+      - "1433:1433"
+    volumes:
+      - mssql_primary_data:/var/opt/mssql
+      - ./mssql-init:/mssql-init:ro
+      - ./data:/data/import
+    networks:
+      featureflow-net:
+        aliases: [mssql-primary]
+    healthcheck:
+      test: >
+        ["CMD-SHELL",
+         "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P $$SA_PASSWORD -No -Q 'SELECT 1'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 45s
+
+  mssql-replica:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: featureflow-mssql-replica
+    hostname: mssql-replica
+    restart: unless-stopped
+    environment:
+      ACCEPT_EULA:         "Y"
+      SA_PASSWORD:         ${MSSQL_SA_PASSWORD}
+      MSSQL_PID:           Developer
+      MSSQL_AGENT_ENABLED: "true"
+    ports:
+      - "1434:1433"
+    volumes:
+      - mssql_replica_data:/var/opt/mssql
+    networks:
+      featureflow-net:
+        aliases: [mssql-replica]
+    depends_on:
+      mssql-primary:
+        condition: service_healthy
+    healthcheck:
+      test: >
+        ["CMD-SHELL",
+         "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P $$SA_PASSWORD -No -Q 'SELECT 1'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 45s
+
+  # ============================================================
+  # MYSQL  —  Primary + 1 replica  (GTID + ROW binlog)
+  # ============================================================
+  # Full Debezium compatibility:
+  #   binlog_format=ROW         — row-level events (required)
+  #   binlog_row_image=FULL     — before + after image
+  #   gtid_mode=ON              — GTID-based replication
+  #   enforce_gtid_consistency  — prevents non-GTID-safe statements
+  #   sync_binlog=1             — durable binlog on every commit
+  #   transaction_isolation=READ-COMMITTED — avoids phantom reads
+  #
+  # A dedicated Debezium DB user with REPLICATION SLAVE +
+  # REPLICATION CLIENT is created by ./mysql-init/01_users.sql
+  #
+  # Repos:
+  #   repo1  bureau_consumer_profiles    (BureauHistoryAggregated)
+  #   repo2  episodes_of_care            (EpisodeOutcomeFeatures)
+  #   repo3  distribution_node_operations(NodeOperationalFeatures)
+  #   repo4  claims_experience           (ClaimsExperienceFeatures)
+  #   repo5  billing_behaviour           (BillingBehaviourFeatures)
+  # ============================================================
+  mysql-primary:
+    image: mysql:8.0
+    container_name: featureflow-mysql-primary
+    hostname: mysql-primary
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE:      featureflow
+      MYSQL_USER:          ${MYSQL_USER}
+      MYSQL_PASSWORD:      ${MYSQL_PASSWORD}
+    command:
+      - "--server-id=1"
+      - "--log-bin=mysql-bin"
+      - "--binlog-format=ROW"
+      - "--binlog-row-image=FULL"
+      - "--gtid-mode=ON"
+      - "--enforce-gtid-consistency=ON"
+      - "--binlog-expire-logs-seconds=604800"   # 7 days retention
+      - "--max-binlog-size=512M"
+      - "--sync-binlog=1"
+      - "--innodb-flush-log-at-trx-commit=1"
+      - "--transaction-isolation=READ-COMMITTED"
+      - "--log-slave-updates=ON"
+      - "--relay-log=mysql-relay-bin"
+      - "--character-set-server=utf8mb4"
+      - "--collation-server=utf8mb4_unicode_ci"
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_primary_data:/var/lib/mysql
+      - ./mysql-init:/docker-entrypoint-initdb.d:ro
+      - ./data:/data/import
+    networks:
+      featureflow-net:
+        aliases: [mysql-primary]
+    healthcheck:
+      test: >
+        ["CMD", "mysqladmin", "ping",
+         "-h", "localhost", "-u", "${MYSQL_USER}", "-p${MYSQL_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  mysql-replica:
+    image: mysql:8.0
+    container_name: featureflow-mysql-replica
+    hostname: mysql-replica
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE:      featureflow
+      MYSQL_USER:          ${MYSQL_USER}
+      MYSQL_PASSWORD:      ${MYSQL_PASSWORD}
+    command:
+      - "--server-id=2"
+      - "--log-bin=mysql-bin"
+      - "--binlog-format=ROW"
+      - "--binlog-row-image=FULL"
+      - "--gtid-mode=ON"
+      - "--enforce-gtid-consistency=ON"
+      - "--read-only=ON"
+      - "--super-read-only=ON"
+      - "--relay-log=mysql-relay-bin"
+      - "--log-slave-updates=ON"
+      - "--transaction-isolation=READ-COMMITTED"
+      - "--character-set-server=utf8mb4"
+      - "--collation-server=utf8mb4_unicode_ci"
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_replica_data:/var/lib/mysql
+      - ./mysql-init-replica:/docker-entrypoint-initdb.d:ro
+    networks:
+      featureflow-net:
+        aliases: [mysql-replica]
+    depends_on:
+      mysql-primary:
+        condition: service_healthy
+    healthcheck:
+      test: >
+        ["CMD", "mysqladmin", "ping",
+         "-h", "localhost", "-u", "${MYSQL_USER}", "-p${MYSQL_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ============================================================
+  # MINIO  —  S3-compatible object store (single node)
+  # ============================================================
+  # No CDC — Feast S3Source polls directly.
+  # Bucket event notifications can be forwarded to Kafka via
+  # a MinIO webhook target when Kafka is deployed separately.
+  #
+  # Buckets (created by minio-init job):
+  #   feast-credit-risk-training
+  #   feast-healthcare-imaging
+  #   feast-supply-chain-timeseries
+  #   feast-insurance-catastrophe
+  #   feast-telecom-cdr
+  # ============================================================
+  minio:
+    image: minio/minio:latest
+    container_name: featureflow-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER:     ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Console
+    volumes:
+      - minio_data:/data
+    networks:
+      - featureflow-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # One-shot: creates the 5 buckets on first run
+  minio-init:
+    image: minio/mc:latest
+    container_name: featureflow-minio-init
+    restart: "no"
+    networks:
+      - featureflow-net
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER:     ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    entrypoint: >
+      bash -c "
+        mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD
+        for b in feast-credit-risk-training
+                 feast-healthcare-imaging
+                 feast-supply-chain-timeseries
+                 feast-insurance-catastrophe
+                 feast-telecom-cdr; do
+          mc mb --ignore-existing local/$$b
+          echo \"Bucket ready: $$b\"
+        done
+      "
+
+  # ============================================================
+  # REDIS  —  Online feature store (all 5 repos)
+  # ============================================================
+  # Namespaces: feast:repo1:*  feast:repo2:*  ...  feast:repo5:*
+  # maxmemory-policy allkeys-lru evicts stale features under pressure.
+  # RDB + AOF persistence keeps the online store warm across restarts.
+  # ============================================================
+  redis:
+    image: redis:7-alpine
+    container_name: featureflow-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+        --appendonly yes
+        --requirepass ${REDIS_PASSWORD}
+        --maxmemory 2gb
+        --maxmemory-policy allkeys-lru
+        --save 900 1
+        --save 300 10
+        --save 60 10000
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - featureflow-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      <<: *hc
+
+# ============================================================
+# VOLUMES
+# ============================================================
+volumes:
+  mongo_primary_data:
+  mongo_secondary1_data:
+  mongo_secondary2_data:
+  postgres_primary_data:
+  postgres_replica_data:
+  postgres_archive:
+  mssql_primary_data:
+  mssql_replica_data:
+  mysql_primary_data:
+  mysql_replica_data:
+  minio_data:
+  redis_data:
+
+# ============================================================
+# NETWORKS
+# ============================================================
+networks:
+  featureflow-net:
+    driver: bridge
+    # To attach to an existing Spark / Kafka / Jupyter network:
+    # external: true
+    # name: your-existing-network-name
