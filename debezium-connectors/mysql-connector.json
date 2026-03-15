@@ -1,0 +1,19 @@
+{
+  "name": "healthcare-mysql-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.mysql.MySqlConnector",
+    "database.hostname": "mysql",
+    "database.port": "3306",
+    "database.user": "debezium",
+    "database.password": "debezium_pass",
+    "database.server.id": "1",
+    "database.server.name": "cdc.mysql",
+    "database.include.list": "healthcare",
+    "table.include.list": "healthcare.bureau_consumer_profiles,healthcare.episodes_of_care",
+    "database.history.kafka.bootstrap.servers": "kafka:29092",
+    "database.history.kafka.topic": "schema-changes.mysql",
+    "include.schema.changes": "true",
+    "snapshot.mode": "initial",
+    "topic.prefix": "mysql"
+  }
+}
