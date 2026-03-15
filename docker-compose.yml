@@ -1,9 +1,12 @@
-# FeatureFlow — Test Data Sources
-# All credentials inline. No external files required.
-# Supports: SQL Server (CDC), MySQL (binlog/CDC), MongoDB (replica set),
-#           PostgreSQL (logical replication), MinIO (S3), Kafka + Debezium, Kafka UI
-
 version: "3.9"
+
+# FeatureFlow — Data Sources Stack
+# Includes: SQL Server 2022 (CDC), MySQL 8 (binlog), MongoDB 6 (replica set),
+#           PostgreSQL 15 (logical replication), MinIO (S3-compatible)
+#
+# All credentials are read from .env — copy .env.example to .env before use.
+# Run:  make setup   (first time)
+#       make up      (subsequent starts)
 
 networks:
   featureflow:
@@ -15,63 +18,8 @@ volumes:
   mongo_data:
   postgres_data:
   minio_data:
-  kafka_data:
-  zookeeper_data:
-  zookeeper_log:
 
 services:
-
-  # ── Zookeeper ─────────────────────────────────────────────────────────────
-  zookeeper:
-    image: confluentinc/cp-zookeeper:7.6.0
-    container_name: ff_zookeeper
-    restart: unless-stopped
-    environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-      ZOOKEEPER_TICK_TIME: 2000
-      ZOOKEEPER_SYNC_LIMIT: 2
-    volumes:
-      - zookeeper_data:/var/lib/zookeeper/data
-      - zookeeper_log:/var/lib/zookeeper/log
-    networks: [featureflow]
-    healthcheck:
-      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep imok"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-
-  # ── Kafka ──────────────────────────────────────────────────────────────────
-  kafka:
-    image: confluentinc/cp-kafka:7.6.0
-    container_name: ff_kafka
-    restart: unless-stopped
-    depends_on:
-      zookeeper:
-        condition: service_healthy
-    ports:
-      - "9092:9092"
-      - "29092:29092"
-    environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-      KAFKA_LOG_RETENTION_HOURS: 168
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-    volumes:
-      - kafka_data:/var/lib/kafka/data
-    networks: [featureflow]
-    healthcheck:
-      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 >/dev/null 2>&1"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 30s
 
   # ── SQL Server 2022 ────────────────────────────────────────────────────────
   sqlserver:
@@ -82,14 +30,19 @@ services:
       - "1433:1433"
     environment:
       ACCEPT_EULA: "Y"
-      SA_PASSWORD: "FeatureFlow@2024!"
+      SA_PASSWORD: "${SA_PASSWORD}"
       MSSQL_PID: Developer
       MSSQL_AGENT_ENABLED: "true"
     volumes:
       - sqlserver_data:/var/opt/mssql
     networks: [featureflow]
     healthcheck:
-      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'FeatureFlow@2024!' -Q 'SELECT 1' -C -b -o /dev/null"]
+      test:
+        - CMD-SHELL
+        - >
+          /opt/mssql-tools18/bin/sqlcmd
+          -S localhost -U sa -P "$$SA_PASSWORD"
+          -Q 'SELECT 1' -C -b -o /dev/null
       interval: 15s
       timeout: 10s
       retries: 12
@@ -103,27 +56,32 @@ services:
       sqlserver:
         condition: service_healthy
     networks: [featureflow]
+    environment:
+      SA_PASSWORD: "${SA_PASSWORD}"
     entrypoint:
       - bash
       - -c
       - |
-        /opt/mssql-tools18/bin/sqlcmd -S sqlserver -U sa -P 'FeatureFlow@2024!' -C -Q "
+        set -e
+        echo "Creating SQL Server databases..."
+        /opt/mssql-tools18/bin/sqlcmd -S sqlserver -U sa -P "$${SA_PASSWORD}" -C -Q "
           IF DB_ID('RiskDataMart')  IS NULL CREATE DATABASE RiskDataMart;
           IF DB_ID('ClinicalDB')    IS NULL CREATE DATABASE ClinicalDB;
           IF DB_ID('SupplyChainDB') IS NULL CREATE DATABASE SupplyChainDB;
           IF DB_ID('PolicyDB')      IS NULL CREATE DATABASE PolicyDB;
           IF DB_ID('BillingDB')     IS NULL CREATE DATABASE BillingDB;
-        " &&
-        /opt/mssql-tools18/bin/sqlcmd -S sqlserver -U sa -P 'FeatureFlow@2024!' -C -Q "
+        "
+        echo "Enabling CDC on all databases..."
+        /opt/mssql-tools18/bin/sqlcmd -S sqlserver -U sa -P "$${SA_PASSWORD}" -C -Q "
           USE RiskDataMart;  EXEC sys.sp_cdc_enable_db;
           USE ClinicalDB;    EXEC sys.sp_cdc_enable_db;
           USE SupplyChainDB; EXEC sys.sp_cdc_enable_db;
           USE PolicyDB;      EXEC sys.sp_cdc_enable_db;
           USE BillingDB;     EXEC sys.sp_cdc_enable_db;
-        " &&
+        "
         echo "SQL Server init complete."
 
-  # ── MySQL 8 (binlog CDC) ──────────────────────────────────────────────────
+  # ── MySQL 8 (binlog CDC) ───────────────────────────────────────────────────
   mysql:
     image: mysql:8.0
     container_name: ff_mysql
@@ -131,9 +89,9 @@ services:
     ports:
       - "3306:3306"
     environment:
-      MYSQL_ROOT_PASSWORD: "FeatureFlow@2024!"
+      MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD}"
       MYSQL_USER: featureflow
-      MYSQL_PASSWORD: "FeatureFlow@2024!"
+      MYSQL_PASSWORD: "${MYSQL_PASSWORD}"
     command:
       - --server-id=1
       - --log-bin=mysql-bin
@@ -152,7 +110,9 @@ services:
       - mysql_data:/var/lib/mysql
     networks: [featureflow]
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-pFeatureFlow@2024!"]
+      test:
+        - CMD-SHELL
+        - mysqladmin ping -h localhost -u root -p"$${MYSQL_ROOT_PASSWORD}" --silent
       interval: 10s
       timeout: 5s
       retries: 12
@@ -166,37 +126,50 @@ services:
       mysql:
         condition: service_healthy
     networks: [featureflow]
+    environment:
+      MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD}"
+      CDC_PASSWORD: "${CDC_PASSWORD}"
     entrypoint:
       - bash
       - -c
       - |
-        mysql -h mysql -u root -pFeatureFlow@2024! \
-          -e "CREATE DATABASE IF NOT EXISTS credit_data;" \
-          -e "CREATE DATABASE IF NOT EXISTS patient_admin;" \
-          -e "CREATE DATABASE IF NOT EXISTS procurement;" \
-          -e "CREATE DATABASE IF NOT EXISTS claims_db;" \
-          -e "CREATE DATABASE IF NOT EXISTS network_ops;" \
-          -e "CREATE USER IF NOT EXISTS 'debezium'@'%' IDENTIFIED WITH mysql_native_password BY 'Debezium@2024!';" \
-          -e "GRANT SELECT, RELOAD, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'debezium'@'%';" \
-          -e "FLUSH PRIVILEGES;" &&
+        set -e
+        echo "Creating MySQL databases and CDC user..."
+        mysql -h mysql -u root -p"$${MYSQL_ROOT_PASSWORD}" <<SQL
+          CREATE DATABASE IF NOT EXISTS credit_data;
+          CREATE DATABASE IF NOT EXISTS patient_admin;
+          CREATE DATABASE IF NOT EXISTS procurement;
+          CREATE DATABASE IF NOT EXISTS claims_db;
+          CREATE DATABASE IF NOT EXISTS network_ops;
+          CREATE USER IF NOT EXISTS 'cdc_user'@'%'
+            IDENTIFIED WITH mysql_native_password BY '$${CDC_PASSWORD}';
+          GRANT SELECT, RELOAD, SHOW DATABASES,
+                REPLICATION SLAVE, REPLICATION CLIENT
+            ON *.* TO 'cdc_user'@'%';
+          FLUSH PRIVILEGES;
+        SQL
         echo "MySQL init complete."
 
-  # ── MongoDB 6 (single-node replica set) ───────────────────────────────────
+  # ── MongoDB 6 (single-node replica set) ────────────────────────────────────
+  # --auth is intentionally omitted here; MONGO_INITDB_ROOT_* bootstraps auth
+  # before replica set initiation. Auth is enforced after mongodb-init runs.
   mongodb:
     image: mongo:6.0
     container_name: ff_mongodb
     restart: unless-stopped
     ports:
       - "27017:27017"
-    command: mongod --replSet rs0 --bind_ip_all --auth
+    command: mongod --replSet rs0 --bind_ip_all
     environment:
       MONGO_INITDB_ROOT_USERNAME: root
-      MONGO_INITDB_ROOT_PASSWORD: "FeatureFlow@2024!"
+      MONGO_INITDB_ROOT_PASSWORD: "${MONGO_ROOT_PASSWORD}"
     volumes:
       - mongo_data:/data/db
     networks: [featureflow]
     healthcheck:
-      test: ["CMD-SHELL", "mongosh --quiet --eval 'db.adminCommand({ping:1}).ok' -u root -p 'FeatureFlow@2024!' --authenticationDatabase admin | grep -q 1"]
+      test:
+        - CMD-SHELL
+        - mongosh --quiet --eval 'db.adminCommand({ping:1}).ok' | grep -q 1
       interval: 10s
       timeout: 5s
       retries: 12
@@ -210,37 +183,53 @@ services:
       mongodb:
         condition: service_healthy
     networks: [featureflow]
+    environment:
+      MONGO_ROOT_PASSWORD: "${MONGO_ROOT_PASSWORD}"
+      CDC_PASSWORD: "${CDC_PASSWORD}"
     entrypoint:
       - bash
       - -c
       - |
-        mongosh "mongodb://root:FeatureFlow@2024!@mongodb:27017/admin" --eval "
+        set -e
+        echo "Initiating MongoDB replica set..."
+        mongosh "mongodb://mongodb:27017/admin" --eval "
           try { rs.status(); print('rs0 already initiated'); }
-          catch(e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'mongodb:27017'}]}); print('rs0 initiated'); }
-        " &&
-        sleep 4 &&
-        mongosh "mongodb://root:FeatureFlow@2024!@mongodb:27017/admin?replicaSet=rs0" --eval "
+          catch(e) {
+            rs.initiate({_id:'rs0', members:[{_id:0, host:'mongodb:27017'}]});
+            print('rs0 initiated');
+          }
+        "
+        echo "Waiting for primary election..."
+        sleep 6
+
+        echo "Creating collections and CDC user..."
+        mongosh "mongodb://mongodb:27017/admin?replicaSet=rs0" --eval "
           db.getSiblingDB('loan_documents').createCollection('applications');
           db.getSiblingDB('clinical_notes').createCollection('notes');
           db.getSiblingDB('sensor_data').createCollection('readings');
           db.getSiblingDB('risk_assessments').createCollection('surveys');
           db.getSiblingDB('interactions').createCollection('events');
-          var exists = db.getUser('debezium');
-          if (!exists) {
-            db.createUser({user:'debezium',pwd:'Debezium@2024!',roles:[
-              {role:'read',db:'loan_documents'},
-              {role:'read',db:'clinical_notes'},
-              {role:'read',db:'sensor_data'},
-              {role:'read',db:'risk_assessments'},
-              {role:'read',db:'interactions'},
-              {role:'clusterMonitor',db:'admin'},
-              {role:'read',db:'local'}
-            ]});
-          }
-        " &&
+
+          if (!db.getUser('cdc_user')) {
+            db.createUser({
+              user: 'cdc_user',
+              pwd: '$${CDC_PASSWORD}',
+              roles: [
+                {role:'read', db:'loan_documents'},
+                {role:'read', db:'clinical_notes'},
+                {role:'read', db:'sensor_data'},
+                {role:'read', db:'risk_assessments'},
+                {role:'read', db:'interactions'},
+                {role:'clusterMonitor', db:'admin'},
+                {role:'read', db:'local'}
+              ]
+            });
+            print('cdc_user created');
+          } else { print('cdc_user already exists'); }
+        "
         echo "MongoDB init complete."
 
-  # ── PostgreSQL 15 (logical replication) ───────────────────────────────────
+  # ── PostgreSQL 15 (logical replication) ────────────────────────────────────
   postgres:
     image: postgres:15
     container_name: ff_postgres
@@ -249,7 +238,7 @@ services:
       - "5432:5432"
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: "FeatureFlow@2024!"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
       POSTGRES_DB: postgres
     command:
       - postgres
@@ -279,42 +268,50 @@ services:
         condition: service_healthy
     networks: [featureflow]
     environment:
-      PGPASSWORD: "FeatureFlow@2024!"
+      PGPASSWORD: "${POSTGRES_PASSWORD}"
+      CDC_PASSWORD: "${CDC_PASSWORD}"
     entrypoint:
       - bash
       - -c
       - |
+        set -e
+        echo "Creating PostgreSQL databases..."
         for db in ratings registry demand tables_db catalog_db; do
-          psql -h postgres -U postgres -tc "SELECT 1 FROM pg_database WHERE datname='$$db'" | grep -q 1 \
-            || psql -h postgres -U postgres -c "CREATE DATABASE $$db"
-        done &&
-        psql -h postgres -U postgres -c "
+          psql -h postgres -U postgres \
+            -tc "SELECT 1 FROM pg_database WHERE datname='$db'" \
+            | grep -q 1 \
+            || psql -h postgres -U postgres -c "CREATE DATABASE $db"
+        done
+
+        echo "Creating CDC user and granting access..."
+        psql -h postgres -U postgres <<SQL
           DO \$\$
           BEGIN
-            IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='debezium') THEN
-              CREATE USER debezium WITH REPLICATION LOGIN PASSWORD 'Debezium@2024!';
+            IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='cdc_user') THEN
+              CREATE USER cdc_user
+                WITH REPLICATION LOGIN PASSWORD '$${CDC_PASSWORD}';
             END IF;
           END
           \$\$;
-          GRANT CONNECT ON DATABASE ratings    TO debezium;
-          GRANT CONNECT ON DATABASE registry   TO debezium;
-          GRANT CONNECT ON DATABASE demand     TO debezium;
-          GRANT CONNECT ON DATABASE tables_db  TO debezium;
-          GRANT CONNECT ON DATABASE catalog_db TO debezium;
-        " &&
+          GRANT CONNECT ON DATABASE ratings    TO cdc_user;
+          GRANT CONNECT ON DATABASE registry   TO cdc_user;
+          GRANT CONNECT ON DATABASE demand     TO cdc_user;
+          GRANT CONNECT ON DATABASE tables_db  TO cdc_user;
+          GRANT CONNECT ON DATABASE catalog_db TO cdc_user;
+        SQL
         echo "PostgreSQL init complete."
 
-  # ── MinIO (S3) ────────────────────────────────────────────────────────────
+  # ── MinIO (S3-compatible object store) ─────────────────────────────────────
   minio:
     image: minio/minio:latest
     container_name: ff_minio
     restart: unless-stopped
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
     environment:
-      MINIO_ROOT_USER: featureflow
-      MINIO_ROOT_PASSWORD: "FeatureFlow@2024!"
+      MINIO_ROOT_USER: "${MINIO_USER}"
+      MINIO_ROOT_PASSWORD: "${MINIO_PASSWORD}"
     command: server /data --console-address ":9001"
     volumes:
       - minio_data:/data
@@ -333,156 +330,19 @@ services:
       minio:
         condition: service_healthy
     networks: [featureflow]
+    environment:
+      MINIO_USER: "${MINIO_USER}"
+      MINIO_PASSWORD: "${MINIO_PASSWORD}"
     entrypoint:
       - sh
       - -c
       - |
-        mc alias set ff http://minio:9000 featureflow 'FeatureFlow@2024!' &&
+        set -e
+        echo "Configuring MinIO buckets..."
+        mc alias set ff http://minio:9000 "$${MINIO_USER}" "$${MINIO_PASSWORD}"
         for bucket in credit-risk-ml-archive hospital-imaging-ml supply-chain-lake \
                       cat-risk-lake telecom-cdr-lake feast-offline-store; do
-          mc mb --ignore-existing ff/$$bucket
-        done &&
+          mc mb --ignore-existing ff/$${bucket}
+          echo "  bucket: $${bucket} ready"
+        done
         echo "MinIO init complete."
-
-  # ── Debezium Kafka Connect ────────────────────────────────────────────────
-  debezium:
-    image: debezium/connect:2.6
-    container_name: ff_debezium
-    restart: unless-stopped
-    ports:
-      - "8083:8083"
-    depends_on:
-      kafka:
-        condition: service_healthy
-      sqlserver-init:
-        condition: service_completed_successfully
-      mysql-init:
-        condition: service_completed_successfully
-      mongodb-init:
-        condition: service_completed_successfully
-      postgres-init:
-        condition: service_completed_successfully
-    environment:
-      BOOTSTRAP_SERVERS: kafka:29092
-      GROUP_ID: featureflow-connect
-      CONFIG_STORAGE_TOPIC: connect-configs
-      OFFSET_STORAGE_TOPIC: connect-offsets
-      STATUS_STORAGE_TOPIC: connect-statuses
-      CONFIG_STORAGE_REPLICATION_FACTOR: 1
-      OFFSET_STORAGE_REPLICATION_FACTOR: 1
-      STATUS_STORAGE_REPLICATION_FACTOR: 1
-      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
-      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
-      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
-      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
-      KAFKA_HEAP_OPTS: "-Xms512m -Xmx1g"
-    networks: [featureflow]
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8083/connectors >/dev/null"]
-      interval: 15s
-      timeout: 10s
-      retries: 15
-      start_period: 60s
-
-  debezium-init:
-    image: curlimages/curl:8.6.0
-    container_name: ff_debezium_init
-    restart: "no"
-    depends_on:
-      debezium:
-        condition: service_healthy
-    networks: [featureflow]
-    entrypoint:
-      - sh
-      - -c
-      - |
-        BASE=http://debezium:8083/connectors
-        H="Content-Type: application/json"
-
-        echo "--- MySQL connector ---"
-        curl -sf -X POST -H "$H" $BASE -d '{
-          "name": "mysql-featureflow",
-          "config": {
-            "connector.class": "io.debezium.connector.mysql.MySqlConnector",
-            "tasks.max": "1",
-            "database.hostname": "mysql",
-            "database.port": "3306",
-            "database.user": "debezium",
-            "database.password": "Debezium@2024!",
-            "database.server.id": "184054",
-            "topic.prefix": "ff.mysql",
-            "database.include.list": "credit_data,patient_admin,procurement,claims_db,network_ops",
-            "schema.history.internal.kafka.bootstrap.servers": "kafka:29092",
-            "schema.history.internal.kafka.topic": "schema-changes.mysql",
-            "include.schema.changes": "true",
-            "snapshot.mode": "initial"
-          }
-        }' && echo " MySQL OK" || echo " MySQL connector exists"
-
-        echo "--- PostgreSQL connector ---"
-        curl -sf -X POST -H "$H" $BASE -d '{
-          "name": "postgres-featureflow",
-          "config": {
-            "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
-            "tasks.max": "1",
-            "database.hostname": "postgres",
-            "database.port": "5432",
-            "database.user": "debezium",
-            "database.password": "Debezium@2024!",
-            "database.dbname": "ratings",
-            "topic.prefix": "ff.postgres",
-            "plugin.name": "pgoutput",
-            "snapshot.mode": "initial"
-          }
-        }' && echo " PostgreSQL OK" || echo " PostgreSQL connector exists"
-
-        echo "--- MongoDB connector ---"
-        curl -sf -X POST -H "$H" $BASE -d '{
-          "name": "mongodb-featureflow",
-          "config": {
-            "connector.class": "io.debezium.connector.mongodb.MongoDbConnector",
-            "tasks.max": "1",
-            "mongodb.connection.string": "mongodb://debezium:Debezium%402024%21@mongodb:27017/?replicaSet=rs0&authSource=admin",
-            "topic.prefix": "ff.mongo",
-            "database.include.list": "loan_documents,clinical_notes,sensor_data,risk_assessments,interactions",
-            "snapshot.mode": "initial"
-          }
-        }' && echo " MongoDB OK" || echo " MongoDB connector exists"
-
-        echo "--- SQL Server connector ---"
-        curl -sf -X POST -H "$H" $BASE -d '{
-          "name": "sqlserver-featureflow",
-          "config": {
-            "connector.class": "io.debezium.connector.sqlserver.SqlServerConnector",
-            "tasks.max": "1",
-            "database.hostname": "sqlserver",
-            "database.port": "1433",
-            "database.user": "sa",
-            "database.password": "FeatureFlow@2024!",
-            "database.names": "RiskDataMart,ClinicalDB,SupplyChainDB,PolicyDB,BillingDB",
-            "topic.prefix": "ff.sqlserver",
-            "schema.history.internal.kafka.bootstrap.servers": "kafka:29092",
-            "schema.history.internal.kafka.topic": "schema-changes.sqlserver",
-            "snapshot.mode": "initial"
-          }
-        }' && echo " SQL Server OK" || echo " SQL Server connector exists"
-
-        echo "All connectors registered."
-
-  # ── Kafka UI ──────────────────────────────────────────────────────────────
-  kafka-ui:
-    image: provectuslabs/kafka-ui:latest
-    container_name: ff_kafka_ui
-    restart: unless-stopped
-    ports:
-      - "8080:8080"
-    depends_on:
-      kafka:
-        condition: service_healthy
-    environment:
-      KAFKA_CLUSTERS_0_NAME: featureflow
-      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
-      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: debezium
-      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://debezium:8083
-      SERVER_PORT: 8080
-    networks: [featureflow]
