@@ -102,21 +102,16 @@ ps:
 
 status:
 	@echo "\n── Debezium Connector Status ──────────────────────────────────"
-	@curl -sf http://localhost:8083/connectors?expand=status | \
-		python3 -c "
-import json,sys
-data=json.load(sys.stdin)
-for name,info in data.items():
-    s=info.get('status',{}).get('connector',{}).get('state','?')
-    tasks=[t.get('state','?') for t in info.get('status',{}).get('tasks',[])]
-    print(f'  {name:<35} {s}  tasks={tasks}')
-" 2>/dev/null || echo "  Debezium not reachable at localhost:8083"
+	@curl -sf 'http://localhost:8083/connectors?expand=status' | \
+		python3 -c "\
+	import json,sys; data=json.load(sys.stdin); [print(f'  {n:<35} {i.get(\"status\",{}).get(\"connector\",{}).get(\"state\",\"?\")}'  ) for n,i in data.items()] \
+	" 2>/dev/null || echo "  Debezium not reachable at localhost:8083" 
 	@echo ""
 
 connectors:
 	@echo "\n── Registered Connectors ──────────────────────────────────────"
 	@curl -sf http://localhost:8083/connectors | python3 -c \
-		"import json,sys; [print('  '+c) for c in json.load(sys.stdin)]" \
+		"import json,sys; [print(\"  \"+c) for c in json.load(sys.stdin)]" \
 		2>/dev/null || echo "  Debezium not reachable"
 	@echo ""
 
